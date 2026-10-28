@@ -1656,6 +1656,7 @@ dependencies = [
  "tokio-stream",
  "tokio-util",
  "toml 1.1.6+spec-1.1.0",
+ "unicode-normalization",
  "unicode-security",
  "unicode-segmentation",
  "url",

@@ -153,6 +153,7 @@ pub enum Command {
     ThemeEditor,
     Highlights,
     Search,
+    SearchBuffer,
     QuitApplication,
     ScrollUpPage,
     ScrollDownPage,
@@ -440,6 +441,7 @@ impl KeyBind {
     default!(theme_editor, "t", COMMAND);
     default!(highlights, "i", COMMAND);
     default!(search, "f", COMMAND | SHIFT);
+    default!(search_buffer, "f", COMMAND);
     default!(scroll_up_page, PageUp);
     default!(scroll_down_page, PageDown);
     // Don't use HOME / END since text input is always focused

@@ -174,6 +174,7 @@ pub enum Entry {
     OpenChannelInNewPane,
     OpenChannelInNewWindow,
     OpenChannelInFocusedPane,
+    SearchChannel,
     // timestamp context
     Timestamp,
     // not sent message context
@@ -320,6 +321,9 @@ impl Entry {
         if !is_focused {
             entries.push(Entry::OpenChannelInFocusedPane);
         }
+
+        entries.push(Entry::HorizontalRule);
+        entries.push(Entry::SearchChannel);
 
         entries
     }
@@ -736,6 +740,18 @@ impl Entry {
                     BufferAction::ReplacePane,
                 )),
             )),
+            (
+                Entry::SearchChannel,
+                Context::Channel(ChannelContext {
+                    server, channel, ..
+                }),
+            ) => Some((
+                "Search in this channel".to_string(),
+                Some(Message::SearchChannel(
+                    (*server).clone(),
+                    (*channel).clone(),
+                )),
+            )),
             (Entry::Timestamp, Context::Timestamp(date_time)) => Some((
                 config.buffer.format_context_menu_timestamp(date_time),
                 Some(Message::CopyTimestamp(**date_time)),
@@ -911,6 +927,7 @@ pub enum Message {
     Whois(Server, Nick),
     Whowas(Server, Nick),
     SearchMessages(Nick),
+    SearchChannel(Server, target::Channel),
     OpenTarget(Server, Target, BufferAction),
     ToggleAccessLevel(Server, target::Channel, Nick, String),
     SendFile(Server, User),
@@ -945,6 +962,7 @@ pub enum Event {
     SendWhois(Server, Nick),
     SendWhowas(Server, Nick),
     SearchMessages(Nick),
+    SearchChannel(Server, target::Channel),
     OpenTarget(Server, Target, BufferAction),
     ToggleAccessLevel(Server, target::Channel, Nick, String),
     SendFile(Server, User),
@@ -974,6 +992,9 @@ pub fn update(message: Message) -> Option<Event> {
         Message::Whois(server, nick) => Some(Event::SendWhois(server, nick)),
         Message::Whowas(server, nick) => Some(Event::SendWhowas(server, nick)),
         Message::SearchMessages(nick) => Some(Event::SearchMessages(nick)),
+        Message::SearchChannel(server, channel) => {
+            Some(Event::SearchChannel(server, channel))
+        }
         Message::OpenTarget(server, target, buffer_action) => {
             Some(Event::OpenTarget(server, target, buffer_action))
         }

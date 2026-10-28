@@ -155,9 +155,10 @@ mod tests {
             Server::from(Arc::<str>::from("libera")),
             target::Channel::from_str("#halloy", &['#'], casemap),
         );
+        let now = chrono::Utc::now();
         let message = message::Message {
             history_id: Id::Undetermined,
-            time: message::Time::client(chrono::Utc::now()),
+            time: message::Time::client(now),
             direction: message::Direction::Received { is_echo: false },
             source: message::Source::User(User::from(Nick::from_str(
                 "casper", casemap,
@@ -188,6 +189,24 @@ mod tests {
             .unwrap();
         assert_eq!(page.hits.len(), 1);
         assert!(page.next.is_none());
+
+        let count = |query: &str| {
+            futures::executor::block_on(searcher.search(
+                search::Query::parse_in(query, &chrono::Utc),
+                search::Range::Latest,
+            ))
+            .unwrap()
+            .hits
+            .len()
+        };
+        // The message's own day, so the test can't straddle midnight.
+        let today = now.date_naive();
+        let tomorrow = today.succ_opt().unwrap();
+        assert_eq!(count("/WRITTEN\\s+else/"), 1);
+        assert_eq!(count("/written$/"), 0);
+        assert_eq!(count(&format!("/written/ on:{today}")), 1);
+        assert_eq!(count(&format!("elsewhere after:{tomorrow}")), 0);
+        assert_eq!(count(&format!("elsewhere before:{tomorrow}")), 1);
 
         drop(database);
     }

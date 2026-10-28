@@ -1608,63 +1608,209 @@ pub(super) fn search(
     range: search::Range,
     limit: usize,
 ) -> Result<search::Page, Error> {
-    let Some(fts) = query.fts() else {
-        return Ok(search::Page {
-            hits: vec![],
-            newest: None,
-            next: None,
-        });
+    let empty = search::Page {
+        hits: vec![],
+        newest: None,
+        next: None,
     };
-    let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+    if limit == 0 || !query.is_runnable() {
+        return Ok(empty);
+    }
+    let fts = query.fts();
+    let matcher = query.matcher();
+    if fts.is_none() && matcher.is_none() {
+        return Ok(empty);
+    }
+    // Newer hits scan up from the cursor, so a short page leaves no gap.
+    let ascending = matches!(range, search::Range::After(_));
+
     // Plain bounds (no `IS NULL OR`) let FTS5 seek to the rowid range.
-    let (before, after) = match range {
+    let (mut before, mut after) = match range {
         search::Range::Latest => (i64::MAX, i64::MIN),
         search::Range::Before(cursor) => (cursor.key, i64::MIN),
         search::Range::After(cursor) => (i64::MAX, cursor.key),
     };
-    let mut statement = connection.prepare_cached(
+    if let Some(time) = query.before {
+        before = before.min(bound_key(time));
+    }
+    if let Some(time) = query.after {
+        after = after.max(bound_key(time).saturating_sub(1));
+    }
+
+    let json = |values: &[String]| {
+        (!values.is_empty())
+            .then(|| serde_json::to_string(values))
+            .transpose()
+    };
+    let within = json(&query.within)?;
+    let kind = query.kind.map(search::BufferKind::tag);
+
+    // Server names hold a NUL before a bouncer's network, so match them here.
+    let histories = if query.has_server_filter() {
+        let histories = connection
+            .prepare_cached(
+                "SELECT id, server FROM history WHERE server IS NOT NULL",
+            )?
+            .query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })?
+            .filter_map(|row| match row {
+                Ok((id, server)) => {
+                    query.matches_server(&server).then_some(Ok(id))
+                }
+                Err(error) => Some(Err(error)),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if histories.is_empty() {
+            return Ok(empty);
+        }
+        Some(serde_json::to_string(&histories)?)
+    } else {
+        None
+    };
+
+    // Post-filtered queries scan candidates in batches, up to a budget per page.
+    let batch = if matcher.is_some() {
+        SEARCH_BATCH
+    } else {
+        limit
+    };
+    let mut statement =
+        connection.prepare_cached(&search_sql(fts.is_some(), ascending))?;
+    let mut hits = vec![];
+    let mut newest = None;
+    let mut next = None;
+    let mut scanned = 0;
+
+    'scan: loop {
+        let rows = statement
+            .query_map(
+                params![
+                    fts,
+                    before,
+                    after,
+                    within,
+                    histories,
+                    kind,
+                    i64::try_from(batch).unwrap_or(i64::MAX),
+                ],
+                |row| {
+                    let key: i64 = row.get(8)?;
+                    // Only build the hits that pass the post-filter.
+                    let hit = match matcher {
+                        Some(matcher) if !search_row_matches(row, matcher)? => {
+                            None
+                        }
+                        _ => Some(search_row(row)?),
+                    };
+                    Ok((hit, key))
+                },
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        let exhausted = rows.len() < batch;
+
+        for (hit, key) in rows {
+            if ascending {
+                newest = Some(search::Cursor { key });
+                after = key;
+            } else {
+                newest.get_or_insert(search::Cursor { key });
+                before = key;
+            }
+            scanned += 1;
+
+            if let Some(hit) = hit {
+                hits.push(hit);
+                if hits.len() == limit {
+                    next = Some(search::Cursor { key });
+                    break 'scan;
+                }
+            }
+        }
+
+        if exhausted {
+            break;
+        }
+        if scanned >= SEARCH_BUDGET {
+            next = Some(search::Cursor {
+                key: if ascending { after } else { before },
+            });
+            break;
+        }
+    }
+
+    if ascending {
+        hits.reverse();
+    }
+
+    Ok(search::Page { hits, newest, next })
+}
+
+const SEARCH_BATCH: usize = 500;
+const SEARCH_BUDGET: usize = 20_000;
+
+fn search_sql(matching: bool, ascending: bool) -> String {
+    // Without positive terms (only a regex), scan the index by rowid instead.
+    let matching = if matching {
+        "message_search MATCH ?1"
+    } else {
+        "?1 IS NULL"
+    };
+    let order = if ascending { "ASC" } else { "DESC" };
+    format!(
         "SELECT m.id, m.time, m.time_from_server, m.msgid, m.content,
                 h.server, h.target, json_extract(h.kind, '$[0]'), s.rowid
          FROM message_search s
          JOIN message m ON m.id = s.message
          JOIN history h ON h.id = m.history
-         WHERE message_search MATCH ?1
-           AND (?2 IS NULL OR h.target = ?2 COLLATE NOCASE)
-           AND s.rowid < ?3
-           AND s.rowid > ?4
+         WHERE {matching}
+           AND s.rowid < ?2
+           AND s.rowid > ?3
+           AND (?4 IS NULL OR h.target COLLATE NOCASE IN (SELECT value FROM json_each(?4)))
+           AND (?5 IS NULL OR h.id IN (SELECT value FROM json_each(?5)))
+           AND (?6 IS NULL OR json_extract(h.kind, '$[0]') = ?6)
            AND json_type(CAST(m.content AS TEXT), '$.redaction') IS NULL
-         ORDER BY s.rowid DESC
-         LIMIT ?5",
-    )?;
-    let rows = statement
-        .query_map(params![fts, query.within, before, after, limit], |row| {
-            let message = row_message(row)?;
-            let server: String = row.get(5)?;
-            let target: Option<String> = row.get(6)?;
-            let tag: String = row.get(7)?;
-            let buffer = match (tag.as_str(), target) {
-                ("channel", Some(target)) => search::Buffer::Channel(target),
-                ("query", Some(target)) => search::Buffer::Query(target),
-                _ => search::Buffer::Server,
-            };
-            let key: i64 = row.get(8)?;
-            Ok((
-                search::Hit {
-                    server,
-                    buffer,
-                    message,
-                },
-                key,
-            ))
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
-    let newest = rows.first().map(|(_, key)| search::Cursor { key: *key });
-    let next = (rows.len() as i64 == limit)
-        .then(|| rows.last())
-        .flatten()
-        .map(|(_, key)| search::Cursor { key: *key });
-    let hits = rows.into_iter().map(|(hit, _)| hit).collect();
-    Ok(search::Page { hits, newest, next })
+         ORDER BY s.rowid {order}
+         LIMIT ?7"
+    )
+}
+
+fn search_row_matches(
+    row: &rusqlite::Row<'_>,
+    matcher: &search::Matcher,
+) -> rusqlite::Result<bool> {
+    let stored: SearchableMessage = serde_json::from_slice(
+        row.get_ref(4)?.as_blob()?,
+    )
+    .map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            4,
+            rusqlite::types::Type::Blob,
+            Box::new(error),
+        )
+    })?;
+    let nick = stored
+        .source
+        .user()
+        .map(|user| user.nickname().as_str().to_owned());
+    Ok(matcher.is_match(&stored.content.text(), nick.as_deref()))
+}
+
+fn search_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<search::Hit> {
+    let message = row_message(row)?;
+    let server: String = row.get(5)?;
+    let target: Option<String> = row.get(6)?;
+    let tag: String = row.get(7)?;
+    let buffer = match (tag.as_str(), target) {
+        ("channel", Some(target)) => search::Buffer::Channel(target),
+        ("query", Some(target)) => search::Buffer::Query(target),
+        _ => search::Buffer::Server,
+    };
+    Ok(search::Hit {
+        server,
+        buffer,
+        message,
+    })
 }
 
 fn indexable_row(
@@ -1676,6 +1822,11 @@ fn indexable_row(
 // FTS5 only orders by rowid without sorting every match, so the rowid encodes time.
 fn search_key(time: i64, id: i64) -> Option<i64> {
     time.checked_mul(1024)?.checked_add(id & 1023)
+}
+
+/// The key a date filter starts at, clamped for dates out of key range.
+fn bound_key(time: DateTime<Utc>) -> i64 {
+    time.timestamp_micros().saturating_mul(1024)
 }
 
 fn is_searchable(kind: &Kind) -> bool {
@@ -1754,8 +1905,12 @@ mod tests {
     }
 
     fn channel(name: &str) -> Kind {
+        channel_on(server(), name)
+    }
+
+    fn channel_on(server: Server, name: &str) -> Kind {
         Kind::Channel(
-            server(),
+            server,
             target::Channel::from_str(
                 name,
                 &['#'],
@@ -1810,12 +1965,209 @@ mod tests {
     fn texts(database: &mut Database, query: &str) -> Vec<String> {
         while database.index(10).unwrap().0 {}
         database
-            .search(&Query::parse(query), search::Range::Latest, 100)
+            .search(&Query::parse_in(query, &Utc), search::Range::Latest, 100)
             .unwrap()
             .hits
             .into_iter()
             .map(|hit| hit.message.content.text().into_owned())
             .collect()
+    }
+
+    #[test]
+    fn search_filters_by_server_kind_and_exclusions() {
+        let mut database = database();
+        let bouncer = Server {
+            name: std::sync::Arc::from("soju"),
+            network: Some(std::sync::Arc::new(
+                crate::bouncer::BouncerNetwork {
+                    id: "1".to_string(),
+                    name: "OFTC".to_string(),
+                },
+            )),
+        };
+        store(
+            &mut database,
+            &channel("#halloy"),
+            vec![message(1, "casper", "hello libera")],
+        );
+        store(
+            &mut database,
+            &Kind::Channel(
+                bouncer.clone(),
+                target::Channel::from_str(
+                    "#halloy",
+                    &['#'],
+                    isupport::CaseMap::default(),
+                ),
+            ),
+            vec![message(2, "andrew", "hello oftc")],
+        );
+        store(
+            &mut database,
+            &Kind::Query(
+                server(),
+                target::Query::from(Nick::from_str(
+                    "andrew",
+                    isupport::CaseMap::default(),
+                )),
+            ),
+            vec![message(3, "andrew", "hello query")],
+        );
+        // A server named like the bouncer's network.
+        store(
+            &mut database,
+            &channel_on(
+                Server::from(std::sync::Arc::<str>::from("OFTC")),
+                "#halloy",
+            ),
+            vec![message(4, "casper", "hello direct")],
+        );
+
+        assert_eq!(
+            texts(&mut database, "hello server:LIBERA"),
+            ["hello query", "hello libera"]
+        );
+        // `bouncer/network` and `name/` pick exactly one of them.
+        let servers = [
+            bouncer.clone(),
+            Server::from(std::sync::Arc::<str>::from("OFTC")),
+        ];
+        let value = |server: &Server| search::server_value(server, &servers);
+        assert_eq!(value(&servers[0]), "soju/OFTC");
+        assert_eq!(value(&servers[1]), "OFTC/");
+        assert_eq!(value(&server()), "libera");
+        assert_eq!(
+            texts(&mut database, "hello server:oftc"),
+            ["hello direct", "hello oftc"]
+        );
+        assert_eq!(
+            texts(&mut database, "hello server:soju/oftc"),
+            ["hello oftc"]
+        );
+        assert_eq!(
+            texts(&mut database, "hello server:oftc/"),
+            ["hello direct"]
+        );
+        assert!(texts(&mut database, "hello server:nowhere").is_empty());
+        assert_eq!(texts(&mut database, "hello server:soju"), ["hello oftc"]);
+        assert_eq!(
+            texts(&mut database, "hello server:soju server:libera is:channel"),
+            ["hello oftc", "hello libera"]
+        );
+        assert_eq!(texts(&mut database, "hello is:query"), ["hello query"]);
+        assert_eq!(
+            texts(&mut database, "hello in:andrew in:#HALLOY server:libera"),
+            ["hello query", "hello libera"]
+        );
+        assert_eq!(
+            texts(&mut database, "hello -query -from:casper"),
+            ["hello oftc"]
+        );
+        assert_eq!(
+            texts(&mut database, "libera OR oftc"),
+            ["hello oftc", "hello libera"]
+        );
+        assert_eq!(
+            texts(&mut database, "from:casper from:andrew hello -oftc"),
+            ["hello direct", "hello query", "hello libera"]
+        );
+    }
+
+    #[test]
+    fn search_filters_by_local_day() {
+        let mut database = database();
+        // 1_700_000_000 is 2023-11-14T22:13:20Z.
+        store(
+            &mut database,
+            &channel("#halloy"),
+            vec![
+                message(0, "casper", "day one"),
+                message(7_200, "casper", "day two"),
+                message(93_600, "casper", "day three"),
+            ],
+        );
+
+        assert_eq!(
+            texts(&mut database, "day after:2023-11-15"),
+            ["day three", "day two"]
+        );
+        assert_eq!(texts(&mut database, "day before:2023-11-15"), ["day one"]);
+        assert_eq!(texts(&mut database, "day on:2023-11-15"), ["day two"]);
+        assert!(texts(&mut database, "day on:2023-11-17").is_empty());
+        // Dates beyond the key range clamp instead of flipping.
+        assert!(texts(&mut database, "day before:1600-01-01").is_empty());
+        assert_eq!(texts(&mut database, "day after:1600-01-01").len(), 3);
+        assert!(texts(&mut database, "day after:2300-01-01").is_empty());
+        assert_eq!(texts(&mut database, "day before:2300-01-01").len(), 3);
+        // Invalid queries never run.
+        assert!(texts(&mut database, "day on:2023-11-32").is_empty());
+    }
+
+    #[test]
+    fn regex_and_case_post_filter_pages_through_candidates() {
+        let mut database = database();
+        let messages = (0..30)
+            .map(|index| {
+                let text = if index % 10 == 0 {
+                    format!("Error {index}")
+                } else {
+                    format!("error {index}")
+                };
+                message(index, "casper", &text)
+            })
+            .collect();
+        store(&mut database, &channel("#halloy"), messages);
+
+        assert_eq!(
+            texts(&mut database, "case:sensitive Error"),
+            ["Error 20", "Error 10", "Error 0"]
+        );
+        assert_eq!(
+            texts(&mut database, "/^error 2[0-2]$/"),
+            ["error 22", "error 21", "Error 20"]
+        );
+        assert_eq!(
+            texts(&mut database, "/^error 2[0-4]$/ -22 -\"error 23\""),
+            ["error 24", "error 21", "Error 20"]
+        );
+        assert!(
+            texts(&mut database, "/^error 2[0-2]$/ -from:casper").is_empty()
+        );
+        assert_eq!(
+            texts(&mut database, "/^error 2[0-2]$/ -Error case:sensitive"),
+            ["error 22", "error 21"]
+        );
+        assert_eq!(
+            texts(&mut database, "error /^error 1\\d$/ case:sensitive"),
+            [
+                "error 19", "error 18", "error 17", "error 16", "error 15",
+                "error 14", "error 13", "error 12", "error 11"
+            ]
+        );
+
+        // Short pages keep going until the hits run out.
+        let query = Query::parse_in("/[05]$/", &Utc);
+        let mut seen = vec![];
+        let mut range = search::Range::Latest;
+        loop {
+            let page = database.search(&query, range, 2).unwrap();
+            seen.extend(
+                page.hits
+                    .iter()
+                    .map(|hit| hit.message.content.text().into_owned()),
+            );
+            match page.next {
+                Some(next) => range = search::Range::Before(next),
+                None => break,
+            }
+        }
+        assert_eq!(
+            seen,
+            [
+                "error 25", "Error 20", "error 15", "Error 10", "error 5",
+                "Error 0"
+            ]
+        );
     }
 
     #[test]
@@ -2028,6 +2380,53 @@ mod tests {
             .search(&query, search::Range::Before(newest), 10)
             .unwrap();
         assert!(page.hits.is_empty());
+    }
+
+    #[test]
+    fn short_search_after_pages_continue_from_their_newest() {
+        let mut database = database();
+        let kind = channel("#halloy");
+        let query = Query::parse("news");
+
+        store(&mut database, &kind, vec![message(0, "casper", "news 0")]);
+        let mut newest = database
+            .search(&query, search::Range::Latest, 10)
+            .unwrap()
+            .newest
+            .unwrap();
+        store(
+            &mut database,
+            &kind,
+            (1..=5)
+                .map(|index| message(index, "casper", &format!("news {index}")))
+                .collect(),
+        );
+
+        // Each page holds the oldest newer hits, newest first.
+        let mut seen = vec![];
+        loop {
+            let page = database
+                .search(&query, search::Range::After(newest), 2)
+                .unwrap();
+            seen.push(
+                page.hits
+                    .iter()
+                    .map(|hit| hit.message.content.text().into_owned())
+                    .collect::<Vec<_>>(),
+            );
+            newest = page.newest.unwrap_or(newest);
+            if page.next.is_none() {
+                break;
+            }
+        }
+        assert_eq!(
+            seen,
+            [
+                vec!["news 2", "news 1"],
+                vec!["news 4", "news 3"],
+                vec!["news 5"]
+            ]
+        );
     }
 
     #[test]

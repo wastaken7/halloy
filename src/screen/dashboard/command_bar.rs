@@ -31,6 +31,7 @@ impl CommandBar {
         resize_buffer: data::buffer::Resize,
         main_window: window::Id,
         show_muted_buffers: bool,
+        has_focused_upstream: bool,
     ) -> Self {
         let state = combo_box::State::new(Command::list(
             servers,
@@ -42,6 +43,7 @@ impl CommandBar {
             version,
             main_window,
             show_muted_buffers,
+            has_focused_upstream,
         ));
 
         let id = widget::Id::unique();
@@ -121,6 +123,8 @@ impl CommandBar {
                             version,
                             main_window,
                             show_muted_buffers,
+                            // Only sizes the layout.
+                            true,
                         )
                         .iter()
                         .map(|command| {
@@ -183,6 +187,7 @@ pub enum Buffer {
     Replace(data::Buffer),
     Popout,
     Merge,
+    SearchFocused,
     ShowMutedBuffers(bool),
 }
 
@@ -214,6 +219,7 @@ impl Command {
         version: &data::Version,
         main_window: window::Id,
         show_muted_buffers: bool,
+        has_focused_upstream: bool,
     ) -> Vec<Self> {
         let servers = Server::list(clients, servers)
             .into_iter()
@@ -225,6 +231,7 @@ impl Command {
             resize_buffer,
             main_window,
             show_muted_buffers,
+            has_focused_upstream,
         )
         .into_iter()
         .map(Command::Buffer);
@@ -308,6 +315,7 @@ impl Buffer {
         resize_buffer: data::buffer::Resize,
         main_window: window::Id,
         show_muted_buffers: bool,
+        has_focused_upstream: bool,
     ) -> Vec<Self> {
         let mut list = vec![Buffer::NewHorizontal, Buffer::NewVertical];
         list.extend(
@@ -317,6 +325,9 @@ impl Buffer {
                 .map(|buffer| Buffer::Replace(buffer.into())),
         );
 
+        if has_focused_upstream {
+            list.push(Buffer::SearchFocused);
+        }
         list.push(Buffer::Close);
 
         match resize_buffer {
@@ -428,6 +439,7 @@ impl std::fmt::Display for Buffer {
             Buffer::Close => write!(f, "Close buffer"),
             Buffer::Popout => write!(f, "Pop out buffer"),
             Buffer::Merge => write!(f, "Merge buffer"),
+            Buffer::SearchFocused => write!(f, "Search in focused buffer"),
             Buffer::Replace(buffer) => match buffer {
                 data::Buffer::Internal(internal) => match internal {
                     buffer::Internal::FileTransfers => {

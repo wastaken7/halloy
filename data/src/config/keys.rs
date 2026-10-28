@@ -35,6 +35,7 @@ pub struct Keyboard {
     #[serde(alias = "highlight")]
     pub highlights: KeyBinds,
     pub search: KeyBinds,
+    pub search_buffer: KeyBinds,
     pub scroll_up_page: KeyBinds,
     pub scroll_down_page: KeyBinds,
     pub scroll_to_top: KeyBinds,
@@ -86,6 +87,7 @@ impl Default for Keyboard {
             theme_editor: KeyBind::theme_editor().into(),
             highlights: KeyBind::highlights().into(),
             search: KeyBind::search().into(),
+            search_buffer: KeyBind::search_buffer().into(),
             scroll_up_page: KeyBind::scroll_up_page().into(),
             scroll_down_page: KeyBind::scroll_down_page().into(),
             scroll_to_top: KeyBind::scroll_to_top().into(),
@@ -150,6 +152,7 @@ impl Keyboard {
                     ScrollToBacklog => &self.scroll_to_backlog,
                     Highlights => &self.highlights,
                     Search => &self.search,
+                    SearchBuffer => &self.search_buffer,
                     CycleNextUnreadBuffer => &self.cycle_next_unread_buffer,
                     CyclePreviousUnreadBuffer => {
                         &self.cycle_previous_unread_buffer

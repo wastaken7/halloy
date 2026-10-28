@@ -17,6 +17,8 @@ Added:
 - Pressing Tab in the config editor inserts an indent, set by `config_editor.indent` (`"tab"` by default, or a positive integer from 1 to 8)
 - Sidebar typing indicators for queries
 - Pane title bar button and shortcut to scroll to the backlog divider
+- Search supports exclusions (`-word`, `-from:nick`), `OR`, `server:`, `is:channel`/`is:query`, `after:`/`before:`/`on:`, `/regex/` and `case:sensitive`, with a filter bar to set them
+- Search the focused buffer via the `search_buffer` key binding, the command bar or a channel's context menu
 
 Fixed:
 

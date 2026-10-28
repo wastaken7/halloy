@@ -1134,6 +1134,17 @@ impl Dashboard {
                             None,
                         );
                     }
+                    SearchBuffer => {
+                        return (
+                            self.search_in(
+                                self.panes.focused_upstream_buffer().cloned(),
+                                clients,
+                                storage,
+                                config,
+                            ),
+                            None,
+                        );
+                    }
                     ToggleFullscreen => {
                         return (
                             window::toggle_fullscreen(),
@@ -2198,6 +2209,19 @@ impl Dashboard {
 
                         None
                     }
+                    buffer::context_menu::Event::SearchChannel(
+                        server,
+                        channel,
+                    ) => {
+                        tasks.push(self.search_in(
+                            Some(buffer::Upstream::Channel(server, channel)),
+                            clients,
+                            storage,
+                            config,
+                        ));
+
+                        None
+                    }
                     buffer::context_menu::Event::OpenTarget(
                         server,
                         target,
@@ -3076,6 +3100,15 @@ impl Dashboard {
                 command_bar::Buffer::Merge => {
                     (self.merge_pane(clients, storage, config), None)
                 }
+                command_bar::Buffer::SearchFocused => (
+                    self.search_in(
+                        self.panes.focused_upstream_buffer().cloned(),
+                        clients,
+                        storage,
+                        config,
+                    ),
+                    None,
+                ),
                 command_bar::Buffer::ShowMutedBuffers(show_muted_buffers) => {
                     self.buffer_settings.show_muted = show_muted_buffers;
                     (Task::none(), None)
@@ -3209,6 +3242,42 @@ impl Dashboard {
                 config,
             )
         }
+    }
+
+    /// Opens Search limited to `upstream`, if there's one.
+    fn search_in(
+        &mut self,
+        upstream: Option<buffer::Upstream>,
+        clients: &mut client::Map,
+        storage: &mut storage::Manager,
+        config: &Config,
+    ) -> Task<Message> {
+        let Some(upstream) = upstream else {
+            return Task::none();
+        };
+
+        let server = upstream.as_server();
+        let query = match upstream.target() {
+            // Display names are ambiguous across bouncers and servers.
+            Some(target) => history::search::scoped_query(
+                &history::search::server_value(server, clients.servers()),
+                target.as_str(),
+            ),
+            // Only this server, not the networks of a bouncer it might be.
+            None => history::search::set_filter(
+                "",
+                "server",
+                Some(&history::search::exact_server_value(server)),
+            ),
+        };
+
+        self.open_buffer(
+            buffer::Internal::Search(Some(query)).into(),
+            config.actions.buffer.open_internal,
+            clients,
+            storage,
+            config,
+        )
     }
 
     fn send_list_command_if_needed(
@@ -4224,6 +4293,7 @@ impl Dashboard {
             self.buffer_resize_action(),
             self.main_window(),
             self.buffer_settings.show_muted,
+            self.panes.focused_upstream_buffer().is_some(),
         );
 
         let focus_task = command_bar.focus();
